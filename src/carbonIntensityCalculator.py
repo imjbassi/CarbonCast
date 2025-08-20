@@ -10,6 +10,7 @@ import math
 import sys
 from datetime import datetime as dt
 from datetime import timezone as tz
+import os
 
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
@@ -17,6 +18,9 @@ import numpy as np
 import pandas as pd
 import pytz as pytz
 import tensorflow as tf
+
+from config_manager import Config
+from config import Config
 
 CARBON_INTENSITY_COLUMN = 1 # column for real-time carbon intensity
 SRC_START_COL = 1
@@ -52,18 +56,35 @@ forcast_carbonRateLifecycle = {"avg_coal_production_forecast": 820, "avg_biomass
 
 
 def initialize(inFileName):
-    print("FILE: ", inFileName)
-    dataset = pd.read_csv(inFileName, header=0, infer_datetime_format=True, 
-                            parse_dates=["UTC time"]) #, index_col=["Local time"]
-    print(dataset.head(2))
-    print(dataset.tail(2))
-    dataset.replace(np.nan, 0, inplace=True) # replace NaN with 0.0
-    num = dataset._get_numeric_data()
-    num[num<0] = 0
-    
-    print(dataset.columns)
-    # print("UTC time", dataset["UTC time"].dtype)
-    return dataset
+    """Initialize dataset with better error handling"""
+    try:
+        if not os.path.exists(inFileName):
+            raise FileNotFoundError(f"Input file not found: {inFileName}")
+            
+        print("FILE: ", inFileName)
+        dataset = pd.read_csv(inFileName, header=0, parse_dates=["UTC time"])
+        
+        if dataset.empty:
+            raise ValueError(f"Input file is empty: {inFileName}")
+            
+        print(dataset.head(2))
+        print(dataset.tail(2))
+        dataset.replace(np.nan, 0, inplace=True)
+        num = dataset._get_numeric_data()
+        num[num<0] = 0
+        
+        print(dataset.columns)
+        return dataset
+        
+    except FileNotFoundError as e:
+        print(f"Error: {e}")
+        sys.exit(1)
+    except pd.errors.EmptyDataError:
+        print(f"Error: CSV file is empty or invalid: {inFileName}")
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error reading file {inFileName}: {e}")
+        sys.exit(1)
 
 def createHourlyTimeCol(dataset, datetime, startDate):
     modifiedDataset = pd.DataFrame(np.empty((17544, len(dataset.columns.values))) * np.nan,
@@ -92,30 +113,45 @@ def calculateCarbonIntensity(dataset, carbonRate, numSources):
     global CARBON_INTENSITY_COLUMN
     carbonIntensity = 0
     carbonCol = []
-    miniDataset = dataset.iloc[:, CARBON_INTENSITY_COLUMN:CARBON_INTENSITY_COLUMN+numSources]
+    
+    # Find the actual source columns by skipping datetime and existing carbon_intensity columns
+    source_start_col = 3  # After 'Unnamed: 0', 'UTC time', 'carbon_intensity'
+    miniDataset = dataset.iloc[:, source_start_col:source_start_col+numSources]
     print("**", miniDataset.columns.values)
-    rowSum = miniDataset.sum(axis=1).to_list()
+    
+    # Only sum numeric columns (exclude datetime)
+    rowSum = miniDataset.sum(axis=1, numeric_only=True).to_list()
+    
     for i in range(len(miniDataset)):
         if(rowSum[i] == 0):
             # basic algorithm to fill missing values if all sources are missing
             # just using the previous hour's value
             # same as electricityMap
-            for j in range(1, len(dataset.columns.values)):
+            for j in range(source_start_col, source_start_col + numSources):
                 if(dataset.iloc[i, j] == 0):
                     dataset.iloc[i, j] = dataset.iloc[i-1, j]
-                miniDataset.iloc[i] = dataset.iloc[i, CARBON_INTENSITY_COLUMN:CARBON_INTENSITY_COLUMN+numSources]
+                miniDataset.iloc[i] = dataset.iloc[i, source_start_col:source_start_col+numSources]
                 # print(miniDataset.iloc[i])
             rowSum[i] = rowSum[i-1]
         carbonIntensity = 0
         for j in range(len(miniDataset.columns.values)):
             source = miniDataset.columns.values[j]
-            sourceContribFrac = miniDataset.iloc[i, j]/rowSum[i]
+            # Handle division by zero
+            if rowSum[i] != 0:
+                sourceContribFrac = miniDataset.iloc[i, j]/rowSum[i]
+            else:
+                sourceContribFrac = 0
             # print(sourceContribFrac, carbonRate[source])
             carbonIntensity += (sourceContribFrac * carbonRate[source])
         if (carbonIntensity == 0):
             print(miniDataset.iloc[i])
         carbonCol.append(round(carbonIntensity, 2)) # rounding to 2 values after decimal place
-    dataset.insert(loc=CARBON_INTENSITY_COLUMN, column="carbon_intensity", value=carbonCol)
+    
+    # Replace the existing carbon_intensity column or add a new one
+    if 'carbon_intensity' in dataset.columns:
+        dataset['carbon_intensity_calculated'] = carbonCol
+    else:
+        dataset.insert(loc=CARBON_INTENSITY_COLUMN, column="carbon_intensity", value=carbonCol)
     return dataset
 
 def calculateCarbonIntensityFromSourceForecasts(dataset, carbonRate, numSources):
@@ -139,7 +175,11 @@ def calculateCarbonIntensityFromSourceForecasts(dataset, carbonRate, numSources)
         carbonIntensity = 0
         for j in range(len(miniDataset.columns.values)):
             source = miniDataset.columns.values[j]
-            sourceContribFrac = miniDataset.iloc[i, j]/rowSum[i]
+            # Handle division by zero
+            if rowSum[i] != 0:
+                sourceContribFrac = miniDataset.iloc[i, j]/rowSum[i]
+            else:
+                sourceContribFrac = 0
             # print(sourceContribFrac, carbonRate[source])
             carbonIntensity += (sourceContribFrac * carbonRate[source])
         if (carbonIntensity == 0):
@@ -198,34 +238,64 @@ def getMape(dates, actual, forecast, predictionWindowHours):
     # return avgDailyMape, mapeScore
     return dailyMapeScore, mapeScore, dailyRmseScore
 
-def runProgram(region, isLifecycle, isForecast, numSources):
-    REAL_TIME_SRC_IN_FILE_NAME = None
-    CARBON_FROM_REAL_TIME_SRC_OUT_FILE_NAME = None
-    FORECAST_SRC_IN_FILE_NAME = None
-    CARBON_FROM_SRC_FORECASTS_OUT_FILE_NAME = None
-
-    if (isLifecycle is True):
-        if (isForecast is True):
-            REAL_TIME_SRC_IN_FILE_NAME = "../data/"+region+"/"+region+"_carbon_lifecycle_"+TEST_PERIOD+".csv"
-            CARBON_FROM_SRC_FORECASTS_OUT_FILE_NAME = "../data/"+region+"/"+region+"_carbon_from_src_prod_forecasts_lifecycle_"+TEST_PERIOD+".csv"
-            FORECAST_SRC_IN_FILE_NAME = "../data/"+region+"/"+region+"_96hr_source_prod_forecasts_DA_"+TEST_PERIOD+".csv"
-        else:
-            REAL_TIME_SRC_IN_FILE_NAME = "../data/"+region+"/"+region+".csv"
-            CARBON_FROM_REAL_TIME_SRC_OUT_FILE_NAME = "../data/"+region+"/"+region+"_lifecycle_emissions.csv"
-    else:
-        if (isForecast is True):
-            REAL_TIME_SRC_IN_FILE_NAME = "../data/"+region+"/"+region+"_carbon_direct_"+TEST_PERIOD+".csv"
-            CARBON_FROM_SRC_FORECASTS_OUT_FILE_NAME = "../data/"+region+"/"+region+"_carbon_from_src_prod_forecasts_direct_"+TEST_PERIOD+".csv"
-            FORECAST_SRC_IN_FILE_NAME = "../data/"+region+"/"+region+"_96hr_source_prod_forecasts_DA_"+TEST_PERIOD+".csv"
-        else:
-            REAL_TIME_SRC_IN_FILE_NAME = "../data/"+region+"/"+region+".csv"
-            CARBON_FROM_REAL_TIME_SRC_OUT_FILE_NAME = "../data/"+region+"/"+region+"_direct_emissions.csv"
-
+def runProgram(region, isLifecycle, isForecast, numSources, config_file=None):
+    """Run program with configuration support and fallback to hardcoded paths"""
     
-    dataset = initialize(REAL_TIME_SRC_IN_FILE_NAME)
+    # Try to use config manager first
+    try:
+        config = Config(config_file)
+        
+        if isForecast:
+            if isLifecycle:
+                real_time_file = config.get_file_path(region, 'carbon_lifecycle')
+                forecast_file = config.get_file_path(region, 'source_forecasts')
+            else:
+                real_time_file = config.get_file_path(region, 'carbon_direct')
+                forecast_file = config.get_file_path(region, 'source_forecasts')
+        else:
+            if isLifecycle:
+                real_time_file = config.get_file_path(region, 'lifecycle_emissions')
+            else:
+                real_time_file = config.get_file_path(region, 'direct_emissions')
+            
+    except (FileNotFoundError, ValueError) as e:
+        print(f"Warning: Config error: {e}")
+        print("Falling back to hardcoded file paths...")
+        
+        # Fallback to hardcoded paths
+        base_path = os.path.dirname(os.path.dirname(__file__))
+        data_path = os.path.join(base_path, "data", region)
+        
+        if not os.path.exists(data_path):
+            print(f"Error: Region directory not found: {data_path}")
+            sys.exit(1)
+            
+        if isForecast:
+            if isLifecycle:
+                real_time_file = os.path.join(data_path, f"{region}_carbon_lifecycle_Jul_Dec_2021.csv")
+                forecast_file = os.path.join(data_path, f"{region}_96hr_source_prod_forecasts_DA_Jul_Dec_2021.csv")
+            else:
+                real_time_file = os.path.join(data_path, f"{region}_carbon_direct_Jul_Dec_2021.csv")
+                forecast_file = os.path.join(data_path, f"{region}_96hr_source_prod_forecasts_DA_Jul_Dec_2021.csv")
+        else:
+            if isLifecycle:
+                real_time_file = os.path.join(data_path, f"{region}_lifecycle_emissions.csv")
+            else:
+                real_time_file = os.path.join(data_path, f"{region}_direct_emissions.csv")
+    
+    # Check if files exist
+    if not os.path.exists(real_time_file):
+        print(f"Error: Real-time file not found: {real_time_file}")
+        sys.exit(1)
+        
+    if isForecast and not os.path.exists(forecast_file):
+        print(f"Error: Forecast file not found: {forecast_file}")
+        sys.exit(1)
+    
+    dataset = initialize(real_time_file)
     forecastDataset = None
     if (isForecast is True):
-        forecastDataset = initialize(FORECAST_SRC_IN_FILE_NAME)
+        forecastDataset = initialize(forecast_file)
 
     # Special case: SE unknown/other lifecycle CEF was 292.9 as per ElectricityMap
     # TODO: In later verwsions, make this saem as CEFs of other regions for consistency.

@@ -1,0 +1,14 @@
+{
+    "data_path": "data",
+    "regions": ["CISO", "DE", "BPAT", "AUS_QLD"],
+    "test_period": "Jul_Dec_2021",
+    "carbon_rates": {
+        "coal": 760,
+        "gas": 370,
+        "solar": 0,
+        "wind": 0,
+        "nuclear": 0,
+        "hydro": 0
+    },
+    "default_num_sources": 6
+}
